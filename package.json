@@ -1,0 +1,12 @@
+{
+  "name": "sandbox-router",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@cloudflare/sandbox": "0.8.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.127.1"
+  }
+}
