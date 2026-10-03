@@ -13,7 +13,7 @@ RULES (mandatory):
 6. Read the output, then continue with the next step or declare completion.
 7. Keep each command block focused — one logical step per block.
 8. If a command fails, read the error, fix it, and retry.
-9. When the task is fully complete, respond with exactly: TASK_COMPLETE
+9. Do NOT say TASK_COMPLETE until you have seen the output of your commands. Output commands first, wait for results, then say TASK_COMPLETE.
 
 Example interaction:
 User: Create a Python script that prints the first 10 Fibonacci numbers and run it.
@@ -165,28 +165,35 @@ export default {
         const llmResponse = await callLLM(messages, env);
         messages.push({ role: "assistant", content: llmResponse });
 
+        // Execute code blocks FIRST, then check for completion
+        const codeBlocks = extractCodeBlocks(llmResponse);
+
+        if (codeBlocks.length > 0) {
+          for (const code of codeBlocks) {
+            const output = await execInSandbox(env, sandboxId, code);
+            executionLog.push({ command: code, output });
+            messages.push({
+              role: "user",
+              content: `Command output:\n\n${output}`,
+            });
+          }
+          // After executing, check if LLM also said TASK_COMPLETE
+          if (isTaskComplete(llmResponse)) {
+            break;
+          }
+          continue;
+        }
+
+        // No code blocks — check if done
         if (isTaskComplete(llmResponse)) {
           break;
         }
 
-        const codeBlocks = extractCodeBlocks(llmResponse);
-
-        if (codeBlocks.length === 0) {
-          messages.push({
-            role: "user",
-            content: "You must output shell commands in a ```bash code block. Please continue.",
-          });
-          continue;
-        }
-
-        for (const code of codeBlocks) {
-          const output = await execInSandbox(env, sandboxId, code);
-          executionLog.push({ command: code, output });
-          messages.push({
-            role: "user",
-            content: `Command output:\n\n${output}`,
-          });
-        }
+        // No code and not done — prompt for shell commands
+        messages.push({
+          role: "user",
+          content: "You must output shell commands in a ```bash code block. Please continue.",
+        });
       }
 
       return new Response(
