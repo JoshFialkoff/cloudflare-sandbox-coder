@@ -35,6 +35,107 @@ python3 /workspace/fib.py
 System (stdout): 0\n1\n1\n2\n3\n5\n8\n13\n21\n34
 Assistant: TASK_COMPLETE`;
 
+// ─────────────────────────────────────────────────────────────
+// Bitwarden Secrets Manager integration (server-side)
+// The BWS machine account token lives ONLY as the Worker secret
+// `bitwarden_token` — never on the Mac, never in chat.
+// ─────────────────────────────────────────────────────────────
+const BWS_API = "https://vault.bitwarden.com/api";
+
+async function bwsListSecrets(env) {
+  const resp = await fetch(`${BWS_API}/projects/${env.BWS_PROJECT_ID}/secrets`, {
+    headers: { Authorization: `Bearer ${env.bitwarden_token}` },
+  });
+  if (!resp.ok) {
+    throw new Error(`Bitwarden list failed: ${resp.status} ${await resp.text()}`);
+  }
+  const data = await resp.json();
+  return data?.data ?? data ?? [];
+}
+
+async function bwsGetSecret(env, secretId) {
+  const resp = await fetch(`${BWS_API}/secrets/${secretId}`, {
+    headers: { Authorization: `Bearer ${env.bitwarden_token}` },
+  });
+  if (!resp.ok) {
+    throw new Error(`Bitwarden get failed: ${resp.status} ${await resp.text()}`);
+  }
+  const s = await resp.json();
+  return { key: s.key, value: s.value };
+}
+
+/** Resolve a list of secret KEYS to a {key: value} map. */
+async function resolveSecrets(env, keys) {
+  if (!env.bitwarden_token) throw new Error("bitwarden_token secret not configured");
+  if (!env.BWS_PROJECT_ID) throw new Error("BWS_PROJECT_ID var not configured");
+  const all = await bwsListSecrets(env);
+  const byKey = new Map(all.map((s) => [s.key, s.id]));
+  const out = {};
+  for (const k of keys) {
+    const id = byKey.get(k);
+    if (id) {
+      const s = await bwsGetSecret(env, id);
+      out[k] = s.value;
+    }
+  }
+  return out;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Cloudflare Access JWT verification (defense in depth)
+// If ACCESS_TEAM_DOMAIN + ACCESS_AUD are configured, the Worker
+// verifies the Cf-Access-Jwt-Assertion header before serving
+// secrets. If they're not set, it relies on the tunnel edge.
+// ─────────────────────────────────────────────────────────────
+function b64urlToBytes(s) {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(b64);
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+}
+
+async function verifyAccessJwt(request, env) {
+  const team = env.ACCESS_TEAM_DOMAIN;
+  const aud = env.ACCESS_AUD;
+  if (!team || !aud) return true; // not configured → Access edge handles it
+
+  const token = request.headers.get("Cf-Access-Jwt-Assertion");
+  if (!token) return false;
+
+  try {
+    const [h, p, sig] = token.split(".");
+    const header = JSON.parse(atob(h.replace(/-/g, "+").replace(/_/g, "/")));
+    const payload = JSON.parse(atob(p.replace(/-/g, "+").replace(/_/g, "/")));
+
+    // Audience + expiry checks
+    const auds = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+    if (!auds.includes(aud)) return false;
+    if (payload.exp * 1000 < Date.now()) return false;
+
+    // Fetch JWKS from the Access team domain
+    const jwksResp = await fetch(`https://${team}/cdn-cgi/access/certs`);
+    if (!jwksResp.ok) return false;
+    const jwks = await jwksResp.json();
+
+    const key = jwks.keys.find((k) => k.kid === header.kid);
+    if (!key) return false;
+
+    const cryptoKey = await crypto.subtle.importKey(
+      "jwk",
+      { kty: key.kty, n: key.n, e: key.e, alg: key.alg },
+      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+      false,
+      ["verify"]
+    );
+    const data = new TextEncoder().encode(`${h}.${p}`);
+    return await crypto.subtle.verify("RSASSA-PKCS1-v1_5", cryptoKey, b64urlToBytes(sig), data);
+  } catch (e) {
+    return false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Sandbox helpers
+// ─────────────────────────────────────────────────────────────
 function extractCodeBlocks(text) {
   const blocks = [];
   const regex = /```(?:bash|sh|shell)?\n([\s\S]*?)```/g;
@@ -67,9 +168,20 @@ async function callLLM(messages, env) {
   return content;
 }
 
-async function execInSandbox(env, sandboxId, command) {
+/**
+ * Execute a command in the sandbox, optionally injecting env vars
+ * resolved server-side from Bitwarden. The bot never sees the values.
+ */
+async function execInSandbox(env, sandboxId, command, envVars = {}) {
   const sandbox = getSandbox(env.SANDBOX, sandboxId);
-  const result = await sandbox.exec(command);
+
+  // Inject secrets as environment variables (server-side only)
+  const exports = Object.entries(envVars)
+    .map(([k, v]) => `export ${k}=${JSON.stringify(v)}`)
+    .join(" && ");
+  const finalCommand = exports ? `${exports} && ${command}` : command;
+
+  const result = await sandbox.exec(finalCommand);
 
   let output = "";
   if (result.stdout) output += result.stdout;
@@ -110,6 +222,9 @@ async function parseMultipart(request, env, sandboxId) {
   return { prompt, sessionId, files };
 }
 
+// ─────────────────────────────────────────────────────────────
+// Worker
+// ─────────────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -120,11 +235,50 @@ export default {
       });
     }
 
+    // ── Secrets endpoints (protected by Cloudflare Access) ──
+    if (url.pathname === "/secrets" && request.method === "GET") {
+      // List available secret KEYS (not values)
+      const ok = await verifyAccessJwt(request, env);
+      if (!ok) return new Response(JSON.stringify({ error: "unauthorized" }), { status: 403 });
+      try {
+        const all = await bwsListSecrets(env);
+        return new Response(
+          JSON.stringify({ success: true, keys: all.map((s) => s.key).sort() }, null, 2),
+          { headers: { "Content-Type": "application/json" } }
+        );
+      } catch (e) {
+        return new Response(JSON.stringify({ success: false, error: e.message }, null, 2), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    if (url.pathname === "/secrets" && request.method === "POST") {
+      // Resolve secret values by key. Body: { "keys": ["OPENAI_API_KEY"] }
+      const ok = await verifyAccessJwt(request, env);
+      if (!ok) return new Response(JSON.stringify({ error: "unauthorized" }), { status: 403 });
+      try {
+        const body = await request.json();
+        const keys = body.keys || [];
+        const resolved = await resolveSecrets(env, keys);
+        return new Response(JSON.stringify({ success: true, secrets: resolved }, null, 2), {
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ success: false, error: e.message }, null, 2), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    // ── Main task execution ──
     if (url.pathname === "/" && request.method === "POST") {
       const contentType = request.headers.get("Content-Type") || "";
       const maxIterations = parseInt(env.MAX_ITERATIONS || "10", 10);
 
-      let userPrompt, sessionId, uploadedFiles;
+      let userPrompt, sessionId, uploadedFiles, secretKeys = [];
 
       if (contentType.includes("multipart/form-data")) {
         sessionId = url.searchParams.get("sessionId") || "default";
@@ -143,6 +297,7 @@ export default {
         userPrompt = body.prompt;
         sessionId = body.sessionId || "default";
         uploadedFiles = [];
+        secretKeys = body.secrets || [];
       }
 
       if (!userPrompt) {
@@ -153,6 +308,25 @@ export default {
       }
 
       const sandboxId = `${env.SANDBOX_ID_PREFIX || "llm-session"}-${sessionId}`;
+
+      // Resolve requested secrets server-side (bot never sees values)
+      let envVars = {};
+      if (secretKeys.length > 0) {
+        try {
+          envVars = await resolveSecrets(env, secretKeys);
+          if (secretKeys.length && Object.keys(envVars).length === 0) {
+            return new Response(
+              JSON.stringify({ error: "No requested secrets found in Bitwarden project", requested: secretKeys }, null, 2),
+              { status: 404, headers: { "Content-Type": "application/json" } }
+            );
+          }
+        } catch (e) {
+          return new Response(JSON.stringify({ error: e.message }, null, 2), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
 
       const messages = [
         { role: "system", content: SYSTEM_PROMPT },
@@ -165,31 +339,27 @@ export default {
         const llmResponse = await callLLM(messages, env);
         messages.push({ role: "assistant", content: llmResponse });
 
-        // Execute code blocks FIRST, then check for completion
         const codeBlocks = extractCodeBlocks(llmResponse);
 
         if (codeBlocks.length > 0) {
           for (const code of codeBlocks) {
-            const output = await execInSandbox(env, sandboxId, code);
+            const output = await execInSandbox(env, sandboxId, code, envVars);
             executionLog.push({ command: code, output });
             messages.push({
               role: "user",
               content: `Command output:\n\n${output}`,
             });
           }
-          // After executing, check if LLM also said TASK_COMPLETE
           if (isTaskComplete(llmResponse)) {
             break;
           }
           continue;
         }
 
-        // No code blocks — check if done
         if (isTaskComplete(llmResponse)) {
           break;
         }
 
-        // No code and not done — prompt for shell commands
         messages.push({
           role: "user",
           content: "You must output shell commands in a ```bash code block. Please continue.",
@@ -203,6 +373,7 @@ export default {
             sandboxId,
             model: env.LLM_MODEL || "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
             uploadedFiles,
+            secretKeys,
             iterations: messages.filter((m) => m.role === "assistant").length,
             finalResponse: messages[messages.length - 1]?.content,
             executionLog,
@@ -239,7 +410,9 @@ export default {
     return new Response(JSON.stringify({
       name: "sandbox-router",
       endpoints: {
-        "POST /": "Sandbox mode (shell execution + file upload)",
+        "POST /": "Sandbox mode (shell execution + file upload + server-side secrets)",
+        "GET /secrets": "List available secret keys (Access-protected)",
+        "POST /secrets": "Resolve secret values by key (Access-protected)",
         "GET /file": "Download file from sandbox",
         "GET /health": "Health check",
       },

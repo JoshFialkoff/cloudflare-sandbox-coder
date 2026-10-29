@@ -1,180 +1,132 @@
 # Goose Mac Bot Setup Guide
 
-Turn your Mac into a secure AI coding agent that delegates execution to a Cloudflare Sandbox via an encrypted tunnel, with all secrets managed by Bitwarden.
+Turn your Mac into a secure AI coding agent that delegates execution to a Cloudflare Sandbox via an encrypted tunnel — with **zero secrets stored on your Mac**.
 
-## What You Get
+## The Zero-Secrets Model
 
-- Goose AI running natively on macOS
-- All execution pushed to isolated Cloudflare Sandbox containers
-- Zero secrets stored on your Mac (everything via Bitwarden)
-- Network access locked down via Cloudflare Zero Trust
+| Secret | Location | Why |
+|--------|----------|-----|
+| Bitwarden Machine Account Token | **Cloudflare Worker secret** (`bitwarden_token`) | Encrypted at rest, never leaves Cloudflare |
+| API keys (OpenAI, Anthropic, …) | **Bitwarden Secrets Manager** | Worker resolves them server-side on demand |
+| Cloudflare Access Service Token | **macOS Keychain** | Encrypted at rest, one-time paste, never in files |
+| Tunnel identity | **`~/.cloudflared/cert.pem`** via `cloudflared tunnel login` | OAuth2 browser flow — no token to share |
+
+> ✅ You've already done the important part: your Bitwarden Machine Account Token is saved
+> as the Worker secret `bitwarden_token` in the sandbox-router production settings.
 
 ## Prerequisites
 
-Install the following via Homebrew:
-
 ```bash
-# Goose AI agent
-brew install goose
-
-# Bitwarden Secrets Manager CLI
-brew install bitwarden/tap/bws
-
-# Cloudflare Tunnel client
-brew install cloudflared
+brew install goose cloudflared jq
 ```
 
-## Step 1: Bitwarden Secrets Manager Setup
+(`bws` is NOT required on the Mac anymore — the Worker owns the token.)
 
-1. Create a Service Account in your Bitwarden Organization:
-   - Bitwarden Admin Console → Secrets Manager → Service Accounts
-   - Create service account, give it read access to your project
-
-2. Create secrets for your bot:
-   | Secret Name | Example Value |
-   |-------------|---------------|
-   | `OPENAI_API_KEY` | sk-... |
-   | `CF_ACCESS_CLIENT_ID` | xxxxxxxx.access |
-   | `CF_ACCESS_CLIENT_SECRET` | xxxxxxxxxxxxxxxxxxxxxxxx |
-   | `CLOUDFLARE_TUNNEL_TOKEN` | eyJ... |
-
-3. Copy the **Service Account Access Token** (starts with `0.`) — this is your `BWS_ACCESS_TOKEN`.
-
-4. Note your **Project ID** (UUID format) — this is your `BWS_PROJECT_ID`.
-
-## Step 2: Configure Cloudflare Tunnel
-
-1. In the Cloudflare Dashboard, create a Tunnel:
-   - Zero Trust → Networks → Tunnels → Create
-   - Name: `goose-bot-tunnel`
-   - Connector: Docker (copy the token)
-
-2. Save the tunnel token as `CLOUDFLARE_TUNNEL_TOKEN` in Bitwarden.
-
-3. Create a Public Hostname:
-   - Subdomain: `bot-api`
-   - Domain: `yourdomain.com`
-   - Service: `HTTP://localhost:8787` (or wherever your sandbox-router is)
-
-4. Apply Zero Trust Access (see [`tunnel/access-policy.md`](./tunnel/access-policy.md)).
-
-## Step 3: Configure `cloudflared` on Mac
+## Step 1: Deploy the Worker with `bitwarden_token`
 
 ```bash
-# Authenticate (one-time)
-cloudflared tunnel login
+cd cloudflare-sandbox-coder
+npm install
 
-# Create and route a tunnel
-cloudflared tunnel create goose-bot-tunnel
-cloudflared tunnel route dns goose-bot-tunnel bot-api.yourdomain.com
+# Set the secrets (one-time; token value typed at prompt, never stored)
+npx wrangler secret put bitwarden_token      # ← your Machine Account Token
+npx wrangler secret put BWS_PROJECT_ID        # ← Bitwarden project UUID
+npx wrangler secret put ACCESS_TEAM_DOMAIN     # ← e.g. your-team.cloudflareaccess.com
+npx wrangler secret put ACCESS_AUD             # ← Access application AUD tag
 
-# Copy config
-cp tunnel/config.yml ~/.cloudflared/config.yml
-# Edit ~/.cloudflared/config.yml with your tunnel UUID
+npx wrangler deploy
+```
 
-# Run
+## Step 2: Configure Cloudflare Access
+
+1. **Create a Service Token** — Zero Trust → Access → Service Auth → Create
+   - Name: `goose-bot-token`
+2. **Create an Application** — Zero Trust → Access → Applications → Self-hosted
+   - Domain: `bot-api.yourdomain.com`
+   - Policy: **Allow** when `Service Token exists`
+3. See [`tunnel/access-policy.md`](./tunnel/access-policy.md) for details.
+
+## Step 3: One-time Mac Setup (OAuth2 + Keychain)
+
+```bash
+# a) OAuth2 tunnel login — browser opens, you sign in. Creates cert.pem.
+cd goose-mac/tunnel
+./tunnel-starter.sh login
+
+# b) Save CF Access Service Token to Keychain (paste once, encrypted)
 cd goose-mac
-bws run -- cloudflared tunnel run goose-bot-tunnel
+./scripts/save-access-creds.sh
 ```
 
-Or use Docker Compose (recommended for production):
+**That's it — no tokens in chat, no .env files, no bws on your Mac.**
+
+## Step 4: Start the Tunnel
 
 ```bash
-export BWS_ACCESS_TOKEN=$(bws secret get <ACCESS_TOKEN_SECRET_ID> | jq -r .value)
-export CLOUDFLARE_TUNNEL_TOKEN=$(bws secret get <TUNNEL_TOKEN_SECRET_ID> | jq -r .value)
-docker compose up -d
+cd goose-mac/tunnel
+./tunnel-starter.sh foreground     # try it live (Ctrl+C to stop)
+./tunnel-starter.sh background     # runs in background, survives chat close
+./tunnel-starter.sh install        # launchd — auto-start on reboot
 ```
 
-## Step 4: Launch the Goose Bot
-
-### Option A: Direct Launch (Development)
+## Step 5: Verify the Full Flow
 
 ```bash
-export BWS_PROJECT_ID="your-project-uuid"
+cd goose-mac/tunnel
+./quick-test.sh
+```
+
+Tests:
+1. **Unauthenticated request blocked** (403) — Access works
+2. **Authenticated health check** (200) — tunnel + Worker reachable
+3. **`/secrets` listing** (200) — Worker can talk to Bitwarden
+4. **Sandbox execution** (200) — code runs in the container
+
+## Step 6: Launch Goose with Secrets
+
+```bash
+cd goose-mac
+
+# List which secrets Goose needs from Bitwarden (comma-separated)
+export SECRET_KEYS="OPENAI_API_KEY,ANTHROPIC_API_KEY"
+
 ./start_bot.sh
 ```
 
-This script:
-1. Validates `bws` and `goose` are installed
-2. Loads all secrets from Bitwarden into the environment
-3. Launches Goose with those secrets available
-4. Configures Goose to use the tunnel endpoint for sandbox execution
-
-### Option B: Docker Launch (Production)
-
-```bash
-cd goose-mac
-docker compose up -d bot-service
-```
-
-The bot service automatically:
-1.pull the tunnel token from Bitwarden
-2. Authenticates to Cloudflare Access
-3. Starts Goose in a containerized environment
-
-## Step 5: Verify the Tunnel + Access Flow
-
-```bash
-# Test that your bot can reach the sandbox through the tunnel
-curl -H "CF-Access-Client-Id: $(bws secret get CF_ACCESS_CLIENT_ID | jq -r .value)" \
-     -H "CF-Access-Client-Secret: $(bws secret get CF_ACCESS_CLIENT_SECRET | jq -r .value)" \
-     https://bot-api.yourdomain.com/health
-```
-
-Expected: `{"status":"ok"}`
-
-## Step 6: Use Goose with the Sandbox
-
-Configure Goose to use your sandbox-router as its execution backend. In Goose settings or via environment:
-
-```bash
-export SANDBOX_API_URL="https://bot-api.yourdomain.com"
-export CF_ACCESS_CLIENT_ID="$(bws secret get CF_ACCESS_CLIENT_ID | jq -r .value)"
-export CF_ACCESS_CLIENT_SECRET="$(bws secret get CF_ACCESS_CLIENT_SECRET | jq -r .value)"
-```
-
-When Goose needs to run code, it will POST to the sandbox-router through the tunnel, sending the Cloudflare Access headers to authenticate.
+The script:
+1. Loads CF Access credentials from **Keychain**
+2. Calls the Worker's `POST /secrets` endpoint — the Worker uses `bitwarden_token`
+   to fetch values from Bitwarden **server-side**
+3. Exports them into Goose's environment (memory only)
+4. Launches Goose
 
 ## Troubleshooting
 
-### `bws` not found
+### `cloudflared tunnel list` → "Error decoding origin cert"
+Your `~/.cloudflared/cert.pem` has expired. Fix:
 ```bash
-brew install bitwarden/tap/bws
+./tunnel-starter.sh login    # OAuth2 browser flow refreshes it
 ```
 
-### `goose` not found
-```bash
-brew install goose
-```
+### 403 on all requests
+- Run `./scripts/save-access-creds.sh` again (creds may be stale)
+- Check the Access policy requires the Service Token
+- Rotate the token in Zero Trust → Access → Service Auth if needed
 
-### Tunnel not connecting
-Check `cloudflared tunnel info goose-bot-tunnel` and confirm the connector is healthy.
+### `/secrets` returns 500
+- Confirm `bitwarden_token` secret is deployed: `npx wrangler secret list`
+- Confirm `BWS_PROJECT_ID` is set and the token has read access to that project
+- Test manually: `curl` the `/secrets` GET endpoint (should list keys)
 
-### Access denied (403)
-- Verify your `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` are current
-- Check Zero Trust Logs for blocked requests
-- Ensure the Service Token is included in your Access policy
-
-### Secrets not loading
-```bash
-# Test BWS connectivity
-bws secret list --project-id <PROJECT_ID>
-```
+### Sandbox task fails
+- Check `npx wrangler deployments list` — latest deploy includes `/secrets` + `secrets:` support
+- Verify the container image built: `npx wrangler deploy --dry-run`
 
 ## Security Checklist
 
-- [ ] No `.env` files committed to git
-- [ ] `BWS_ACCESS_TOKEN` has **read-only** access (no write)
-- [ ] Cloudflare Access policy restricts to Service Auth only
-- [ ] Tunnel token rotated quarterly
-- [ ] Service Tokens rotated quarterly
-- [ ] `start_bot.sh` file permissions: `chmod 700 start_bot.sh`
-
-## Files Reference
-
-| File | Purpose |
-|------|---------|
-| `start_bot.sh` | Launch Goose with BWS-injected secrets |
-| `docker-compose.yml` | Production tunnel + bot orchestration |
-| `tunnel/config.yml` | `cloudflared` configuration |
-| `tunnel/access-policy.md` | Zero Trust policy setup steps |
+- [ ] `bitwarden_token` exists only as a Worker secret (never in git/env/chat)
+- [ ] `BWS_ACCESS_TOKEN` has **read-only** access in Bitwarden
+- [ ] CF Access policy allows **Service Tokens only**
+- [ ] CF Access creds in **Keychain**, not files
+- [ ] Tunnel runs via **OAuth2 cert.pem**, no token files
+- [ ] Rotate the Service Token quarterly
