@@ -35,9 +35,6 @@
   "vars": {
     "MAX_ITERATIONS": "10",
     "SANDBOX_ID_PREFIX": "llm-session",
-    "LLM_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-    "BWS_PROJECT_ID": "your-bitwarden-project-uuid",
-    "ACCESS_TEAM_DOMAIN": "your-team.cloudflareaccess.com",
-    "ACCESS_AUD": "your-access-application-aud-tag"
+    "LLM_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
   }
 }
