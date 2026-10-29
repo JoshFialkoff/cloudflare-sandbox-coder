@@ -1,0 +1,57 @@
+version: '3.8'
+
+# Production Docker Compose for Goose Bot + Cloudflare Tunnel
+# All secrets are injected via Bitwarden Secrets Manager (bws).
+# No .env files are used for actual secrets.
+
+services:
+  cloudflare-tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: always
+    # The tunnel token is passed securely; it is NOT stored in an .env file.
+    # Set it via: export CLOUDFLARE_TUNNEL_TOKEN=$(bws secret get ...)
+    command: tunnel run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    networks:
+      - bot-network
+    healthcheck:
+      test: ["CMD", "cloudflared", "tunnel", "info", "goose-bot-tunnel"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  bot-service:
+    # Replace with your actual bot image or build from a Dockerfile
+    image: ghcr.io/block/goose:latest
+    restart: always
+    environment:
+      # These env vars are injected at runtime by your orchestrator.
+      # Do NOT write them to a .env file.
+      - BWS_ACCESS_TOKEN=${BWS_ACCESS_TOKEN}
+      - BWS_PROJECT_ID=${BWS_PROJECT_ID}
+      - GOOSE_PROFILE=${GOOSE_PROFILE:-default}
+      - SANDBOX_API_URL=${SANDBOX_API_URL:-https://bot-api.yourdomain.com}
+    command: >
+      sh -c "
+        # Install bws if not present in the image
+        if ! command -v bws >/dev/null 2>&1; then
+          curl -fsSL https://github.com/bitwarden/sdk/releases/latest/download/bws-x86_64-unknown-linux-gnu -o /usr/local/bin/bws &&
+          chmod +x /usr/local/bin/bws;
+        fi &&
+        # Launch Goose with BWS-injected secrets
+        bws run --project \"$BWS_PROJECT_ID\" -- goose --profile \"$GOOSE_PROFILE\"
+      "
+    networks:
+      - bot-network
+    depends_on:
+      - cloudflare-tunnel
+    volumes:
+      # Optional: mount a persistent profile directory for Goose state
+      - goose-profiles:/root/.local/share/goose
+
+networks:
+  bot-network:
+    driver: bridge
+
+volumes:
+  goose-profiles:
