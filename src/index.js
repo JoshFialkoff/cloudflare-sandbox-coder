@@ -82,6 +82,35 @@ async function resolveSecrets(env, keys) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Request authentication — two layers (either can pass):
+//   LAYER 1 (recommended): Cloudflare Access Service Token
+//     stored as Worker secrets `cf_access_client_id` +
+//     `cf_access_client_secret`. The Worker compares the
+//     CF-Access-Client-Id / CF-Access-Client-Secret headers
+//     against these server-side. No Keychain needed on the Mac.
+//   LAYER 2 (defense in depth): Cloudflare Access JWT
+//     verification using ACCESS_TEAM_DOMAIN + ACCESS_AUD.
+// ─────────────────────────────────────────────────────────────
+function headersEqual(a, b) {
+  if (!a || !b) return false;
+  return a.trim() === b.trim();
+}
+
+async function isAuthorized(request, env) {
+  // Layer 1: Service Token headers vs Worker secrets
+  if (env.cf_access_client_id && env.cf_access_client_secret) {
+    const id = request.headers.get("CF-Access-Client-Id") || "";
+    const secret = request.headers.get("CF-Access-Client-Secret") || "";
+    if (headersEqual(id, env.cf_access_client_id) && headersEqual(secret, env.cf_access_client_secret)) {
+      return true;
+    }
+  }
+
+  // Layer 2: Access JWT assertion (if configured)
+  return verifyAccessJwt(request, env);
+}
+
+// ─────────────────────────────────────────────────────────────
 // Cloudflare Access JWT verification (defense in depth)
 // If ACCESS_TEAM_DOMAIN + ACCESS_AUD are configured, the Worker
 // verifies the Cf-Access-Jwt-Assertion header before serving
@@ -238,7 +267,7 @@ export default {
     // ── Secrets endpoints (protected by Cloudflare Access) ──
     if (url.pathname === "/secrets" && request.method === "GET") {
       // List available secret KEYS (not values)
-      const ok = await verifyAccessJwt(request, env);
+      const ok = await isAuthorized(request, env);
       if (!ok) return new Response(JSON.stringify({ error: "unauthorized" }), { status: 403 });
       try {
         const all = await bwsListSecrets(env);
@@ -256,7 +285,7 @@ export default {
 
     if (url.pathname === "/secrets" && request.method === "POST") {
       // Resolve secret values by key. Body: { "keys": ["OPENAI_API_KEY"] }
-      const ok = await verifyAccessJwt(request, env);
+      const ok = await isAuthorized(request, env);
       if (!ok) return new Response(JSON.stringify({ error: "unauthorized" }), { status: 403 });
       try {
         const body = await request.json();
