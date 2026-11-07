@@ -10,7 +10,7 @@
   "containers": [
     {
       "class_name": "Sandbox",
-      "image": "./Dockerfile",
+      "image": "docker.io/cloudflare/sandbox:0.12.10",
       "instance_type": "lite",
       "max_instances": 3
     }
@@ -33,7 +33,7 @@
     "enabled": true
   },
   "vars": {
-    "MAX_ITERATIONS": "10",
+    "MAX_ITERATIONS": "25",
     "SANDBOX_ID_PREFIX": "llm-session",
     "LLM_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
   }
