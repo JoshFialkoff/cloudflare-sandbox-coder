@@ -55,6 +55,7 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           push: true
+          load: true
           tags: |
             ${{ steps.ghcr.outputs.image }}:${{ steps.tag.outputs.tag }}
             ${{ steps.ghcr.outputs.image }}:sha-${{ github.sha }}
