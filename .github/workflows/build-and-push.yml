@@ -25,15 +25,12 @@ on:
   workflow_dispatch:
 
 env:
-  # GHCR image name (lowercase).  Uses the repo owner/name automatically.
-  GHCR_IMAGE: ghcr.io/${{ github.repository }}
-  # Cloudflare Registry image name.  Uses the account ID from secrets.
   CF_IMAGE: registry.cloudflare.com/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/sandbox-router
   IMAGE_TAG: latest
 
 permissions:
-  contents: write   # needed to commit the updated wrangler.jsonc
-  packages: write    # needed to push to GHCR
+  contents: write
+  packages: write
 
 jobs:
   build-and-push:
@@ -45,7 +42,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # ── 1. Build & push to GHCR (storage / versioning) ──────────────
+      - name: Lowercase GHCR image name
+        id: ghcr
+        run: echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -61,20 +61,16 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.GHCR_IMAGE }}:${{ env.IMAGE_TAG }}
-            ${{ env.GHCR_IMAGE }}:sha-${{ github.sha }}
+            ${{ steps.ghcr.outputs.image }}:${{ env.IMAGE_TAG }}
+            ${{ steps.ghcr.outputs.image }}:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # ── 2. Mirror the image to the Cloudflare Registry ─────────────
-      # Cloudflare Containers can only pull from the Cloudflare Registry
-      # (or Docker Hub / ECR / GAR), not from GHCR.  We re-tag the image
-      # we just built and push it with `wrangler containers push`.
       - name: Install Wrangler
         run: npm install -g wrangler
 
       - name: Tag image for Cloudflare Registry
-        run: docker tag ${{ env.GHCR_IMAGE }}:${{ env.IMAGE_TAG }} ${{ env.CF_IMAGE }}:${{ env.IMAGE_TAG }}
+        run: docker tag ${{ steps.ghcr.outputs.image }}:${{ env.IMAGE_TAG }} ${{ env.CF_IMAGE }}:${{ env.IMAGE_TAG }}
 
       - name: Push to Cloudflare Registry
         env:
@@ -82,26 +78,18 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: npx wrangler containers push ${{ env.CF_IMAGE }}:${{ env.IMAGE_TAG }}
 
-      # ── 3. Update wrangler.jsonc to reference the CF Registry image ─
       - name: Update wrangler.jsonc image reference
         run: |
-          # Replace the containers[].image value with the CF Registry reference.
-          # Works for both "image": "./Dockerfile" and any existing registry ref.
           python3 - <<'PY'
-          import json, pathlib
-
+          import json, pathlib, re
           p = pathlib.Path("wrangler.jsonc")
           text = p.read_text()
-          # Strip JSONC comments before parsing (simple line-comment removal).
-          import re
           cleaned = re.sub(r'^\s*//.*$', '', text, flags=re.MULTILINE)
           cfg = json.loads(cleaned)
-
           cf_image = "${{ env.CF_IMAGE }}:${{ env.IMAGE_TAG }}"
           for c in cfg.get("containers", []):
               if "image" in c:
                   c["image"] = cf_image
-
           p.write_text(json.dumps(cfg, indent=2) + "\n")
           print(f"Updated wrangler.jsonc → image: {cf_image}")
           PY
@@ -114,7 +102,6 @@ jobs:
           git commit -m "chore: reference Cloudflare Registry image for sandbox-router container" || echo "Nothing to commit"
           git push
 
-      # ── 4. Deploy the Worker ────────────────────────────────────────
       - name: Deploy Worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
