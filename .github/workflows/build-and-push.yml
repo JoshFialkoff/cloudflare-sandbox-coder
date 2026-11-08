@@ -2,17 +2,9 @@
 # storage/versioning, then push the same image to the Cloudflare
 # Registry and deploy the Worker.
 #
-# GHCR is NOT a supported image source for Cloudflare Containers
-# (only Cloudflare Registry, Docker Hub, Amazon ECR, and Google
-# Artifact Registry are).  The workflow therefore mirrors the image
-# to the Cloudflare Registry and updates wrangler.jsonc to reference
-# that registry — not GHCR directly.
-#
 # Required GitHub secrets:
 #   CLOUDFLARE_API_TOKEN  – Cloudflare API token with Workers/Containers permissions
 #   CLOUDFLARE_ACCOUNT_ID – Your Cloudflare account ID
-#
-# The GITHUB_TOKEN is provided automatically and used to push to GHCR.
 
 name: Build & Push Container Image
 
@@ -26,7 +18,6 @@ on:
 
 env:
   CF_IMAGE: registry.cloudflare.com/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/sandbox-router
-  IMAGE_TAG: latest
 
 permissions:
   contents: write
@@ -46,6 +37,10 @@ jobs:
         id: ghcr
         run: echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
+      - name: Set image tag (short SHA — Cloudflare disallows 'latest')
+        id: tag
+        run: echo "tag=$(echo '${{ github.sha }}' | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -61,7 +56,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ steps.ghcr.outputs.image }}:${{ env.IMAGE_TAG }}
+            ${{ steps.ghcr.outputs.image }}:${{ steps.tag.outputs.tag }}
             ${{ steps.ghcr.outputs.image }}:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -70,13 +65,13 @@ jobs:
         run: npm install -g wrangler
 
       - name: Tag image for Cloudflare Registry
-        run: docker tag ${{ steps.ghcr.outputs.image }}:${{ env.IMAGE_TAG }} ${{ env.CF_IMAGE }}:${{ env.IMAGE_TAG }}
+        run: docker tag ${{ steps.ghcr.outputs.image }}:${{ steps.tag.outputs.tag }} ${{ env.CF_IMAGE }}:${{ steps.tag.outputs.tag }}
 
       - name: Push to Cloudflare Registry
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npx wrangler containers push ${{ env.CF_IMAGE }}:${{ env.IMAGE_TAG }}
+        run: npx wrangler containers push ${{ env.CF_IMAGE }}:${{ steps.tag.outputs.tag }}
 
       - name: Update wrangler.jsonc image reference
         run: |
@@ -86,7 +81,7 @@ jobs:
           text = p.read_text()
           cleaned = re.sub(r'^\s*//.*$', '', text, flags=re.MULTILINE)
           cfg = json.loads(cleaned)
-          cf_image = "${{ env.CF_IMAGE }}:${{ env.IMAGE_TAG }}"
+          cf_image = "${{ env.CF_IMAGE }}:${{ steps.tag.outputs.tag }}"
           for c in cfg.get("containers", []):
               if "image" in c:
                   c["image"] = cf_image
