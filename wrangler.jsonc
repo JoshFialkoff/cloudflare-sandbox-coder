@@ -4,13 +4,14 @@
   "main": "src/index.js",
   "compatibility_date": "2026-08-28",
   "compatibility_flags": ["nodejs_compat"],
-  "ai": {
-    "binding": "AI"
+  "observability": {
+    "enabled": true
   },
   "containers": [
     {
       "class_name": "Sandbox",
-      "image": "docker.io/cloudflare/sandbox:0.12.10",
+      "name": "sandbox-router-sandbox",
+      "image": "registry.cloudflare.com/ad9d77d8f16147c01ff26b56d41cb5a9/sandbox-router:latest",
       "instance_type": "lite",
       "max_instances": 3
     }
@@ -23,18 +24,31 @@
       }
     ]
   },
-  "migrations": [
-    {
-      "new_sqlite_classes": ["Sandbox"],
-      "tag": "v1"
+  "exports": {
+    "Sandbox": {
+      "type": "durable-object",
+      "storage": "sqlite"
     }
-  ],
-  "observability": {
-    "enabled": true
+  },
+  "ai": {
+    "binding": "AI"
   },
   "vars": {
+    "BWS_PROJECT_ID": "7afd61b4-a7cb-49f0-b215-b4bd0111966a",
+    "GOOGLE_ADS_CUSTOMER_ID": "587-159-6696",
     "MAX_ITERATIONS": "25",
     "SANDBOX_ID_PREFIX": "llm-session",
     "LLM_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+  },
+  "secrets": {
+    "required": [
+      "bitwarden_secret",
+      "CLOUDFLARE_API_KEY",
+      "CUSTOM_SMART_ROUTER_CLOUDFLARE_WORKERS_AI_API_KEY",
+      "GOOGLE_ADS_CLIENT_ID",
+      "GOOGLE_ADS_CLIENT_SECRET",
+      "GOOGLE_ADS_DEVELOPER_TOKEN",
+      "GOOGLE_ADS_REFRESH_TOKEN"
+    ]
   }
 }
