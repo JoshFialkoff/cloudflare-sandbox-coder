@@ -13,7 +13,7 @@
     {
       "class_name": "Sandbox",
       "name": "sandbox-router-sandbox",
-      "image": "registry.cloudflare.com/ad9d77d8f16147c01ff26b56d41cb5a9/sandbox-router:645782477baf",
+      "image": "registry.cloudflare.com/ad9d77d8f16147c01ff26b56d41cb5a9/sandbox-router:866cddee9de4",
       "instance_type": "lite",
       "max_instances": 3
     }
