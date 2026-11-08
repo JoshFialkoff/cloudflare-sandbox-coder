@@ -101,4 +101,5 @@ jobs:
           git commit -m "chore: reference Cloudflare Registry image for sandbox-router container" || echo "Nothing to commit"
           git pull --rebase origin main || true
           git push || git push --force-with-lease
+          npm install
           npx wrangler deploy
