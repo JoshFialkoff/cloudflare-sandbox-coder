@@ -345,12 +345,7 @@ async function callMcpTool(name, args, env, botId) {
 async function handleMcp(request, env, botId) {
   const method = request.method;
   if (method === "GET") {
-    const stream = new ReadableStream({
-      start(controller) { controller.enqueue(new TextEncoder().encode(": keepalive\n\n")); },
-    });
-    return new Response(stream, {
-      headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" },
-    });
+    return new Response("Method Not Allowed", { status: 405, headers: { "Allow": "POST" } });
   }
   if (method === "DELETE") { return new Response(null, { status: 202 }); }
   if (method !== "POST") { return new Response("Method not allowed", { status: 405 }); }
