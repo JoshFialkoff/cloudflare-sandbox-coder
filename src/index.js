@@ -1,10 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 
-// ─── Sandbox Durable Object ──────────────────────────────────────────────────
-// Replaces the old @cloudflare/sandbox 0.x Sandbox DO class.
-// Manages a Cloudflare Container instance and exposes exec/setEnvVars via RPC.
+// ═══════════════════════════════════════════════════════════════════════════════
+// SandboxV2 Durable Object — manages a Cloudflare Container instance
+// ═══════════════════════════════════════════════════════════════════════════════
 
-export class Sandbox extends DurableObject {
+export class SandboxV2 extends DurableObject {
   async ensureRunning() {
     const container = this.ctx.container;
     if (!container) throw new Error("Container binding is not configured");
@@ -17,6 +17,14 @@ export class Sandbox extends DurableObject {
     const stored = (await this.ctx.storage.get("envVars")) || {};
     Object.assign(stored, vars);
     await this.ctx.storage.put("envVars", stored);
+  }
+
+  async getEnvVars() {
+    return (await this.ctx.storage.get("envVars")) || {};
+  }
+
+  async clearEnvVars() {
+    await this.ctx.storage.delete("envVars");
   }
 
   async exec(command) {
@@ -44,7 +52,94 @@ function shellQuote(v) {
   return `'${String(v).replace(/'/g, "'\\''")}'`;
 }
 
-// ─── System Prompt: Enforce shell-based code execution ───────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// Bot Authentication — per-bot API keys for isolated container access
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// BOT_KEYS:       JSON map of botId → apiKey   (e.g. {"ads-bot":"key123"})
+// BOT_SECRET_SCOPES: JSON map of botId → ["SECRET_KEY1", "SECRET_KEY2"]
+//
+// If BOT_KEYS is unset or empty, authentication is disabled (backward-compatible).
+// If BOT_KEYS is set, all requests must include `Authorization: Bearer <apiKey>`.
+
+function getBotKeys(env) {
+  try { return JSON.parse(env.BOT_KEYS || "{}"); } catch { return {}; }
+}
+
+function getBotScopes(env) {
+  try { return JSON.parse(env.BOT_SECRET_SCOPES || "{}"); } catch { return {}; }
+}
+
+function authenticateBot(request, env) {
+  const botKeys = getBotKeys(env);
+  if (Object.keys(botKeys).length === 0) {
+    // No bot keys configured — backward-compatible mode, use "default" bot
+    return "default";
+  }
+  const authHeader = request.headers.get("Authorization") || "";
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match) return null;
+  const apiKey = match[1];
+  for (const [botId, key] of Object.entries(botKeys)) {
+    if (key === apiKey) return botId;
+  }
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Scoped Bitwarden Secret Resolution
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Instead of passing the raw bitwarden_secret (BWS machine account token) into
+// the sandbox as a persistent env var, the Worker resolves only the secrets the
+// bot is authorized for and injects those values. The bitwarden_secret is used
+// inline in a single bws command and is never stored in the sandbox environment.
+
+async function resolveScopedSecrets(env, sandboxId, botId) {
+  const scopes = getBotScopes(env)[botId] || [];
+  if (scopes.length === 0) return {};
+
+  const stub = getSandboxStub(env, sandboxId);
+  const token = env.bitwarden_secret;
+  if (!token) return {};
+
+  const projectId = env.BWS_PROJECT_ID;
+  if (!projectId) return {};
+
+  // Run bws in the sandbox with the token inline (not stored as env var)
+  const listCmd = `BWS_ACCESS_TOKEN=${shellQuote(token)} bws secret list ${projectId} --output json 2>/dev/null`;
+  const listResult = await stub.exec(listCmd);
+
+  let secrets;
+  try {
+    secrets = JSON.parse(listResult.stdout || "");
+  } catch {
+    return {};
+  }
+  if (!Array.isArray(secrets)) return {};
+
+  const envVars = {};
+  for (const secret of secrets) {
+    if (!scopes.includes(secret.key)) continue;
+    if (secret.value) {
+      envVars[secret.key] = secret.value;
+    } else {
+      // Value not in list response — fetch individually
+      const getCmd = `BWS_ACCESS_TOKEN=${shellQuote(token)} bws secret get ${shellQuote(secret.id)} --output json 2>/dev/null`;
+      const getResult = await stub.exec(getCmd);
+      try {
+        const secretData = JSON.parse(getResult.stdout || "");
+        if (secretData.value) envVars[secret.key] = secretData.value;
+      } catch { /* skip on error */ }
+    }
+  }
+
+  return envVars;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// System Prompt — enforce shell-based code execution
+// ═══════════════════════════════════════════════════════════════════════════════
 
 const SYSTEM_PROMPT = `You are an AI coding assistant that executes tasks by writing shell commands.
 
@@ -79,7 +174,9 @@ python3 /workspace/fib.py
 System (stdout): 0\n1\n1\n2\n3\n5\n8\n13\n21\n34
 Assistant: TASK_COMPLETE`;
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════════════════════
 
 function extractCodeBlocks(text) {
   const blocks = [];
@@ -95,7 +192,19 @@ function isTaskComplete(text) {
   return /\bTASK_COMPLETE\b/i.test(text);
 }
 
-// ─── LLM call ─────────────────────────────────────────────────────────────────
+// Safe base64 encoding for large files (avoids call stack overflow)
+function uint8ToBase64(bytes) {
+  let binary = "";
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LLM call
+// ═══════════════════════════════════════════════════════════════════════════════
 
 async function callLLM(messages, env) {
   const model = env.LLM_MODEL || "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
@@ -110,22 +219,28 @@ async function callLLM(messages, env) {
   return content;
 }
 
-// ─── Sandbox access via Durable Object RPC ────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// SandboxV2 access via Durable Object RPC
+// ═══════════════════════════════════════════════════════════════════════════════
 
 function getSandboxStub(env, sandboxId) {
   const id = env.SANDBOX.idFromName(sandboxId);
   return env.SANDBOX.get(id);
 }
 
-async function setupSandboxEnv(env, sandboxId) {
-  const stub = getSandboxStub(env, sandboxId);
-  const envVars = {};
-  if (env.bitwarden_secret) {
-    envVars.BWS_ACCESS_TOKEN = env.bitwarden_secret;
-    envVars.BWS_TOKEN = env.bitwarden_secret;
-  }
-  if (Object.keys(envVars).length > 0) {
-    await stub.setEnvVars(envVars);
+// Per-bot sandbox ID — each bot gets its own isolated container
+function getSandboxId(env, botId, sessionId) {
+  const prefix = env.SANDBOX_ID_PREFIX || "llm-session";
+  return `${prefix}-${botId}-${sessionId}`;
+}
+
+// Resolve scoped secrets and inject into the sandbox (bitwarden_secret is NOT stored)
+async function setupSandboxEnv(env, sandboxId, botId) {
+  if (!botId) return;
+  const scopedSecrets = await resolveScopedSecrets(env, sandboxId, botId);
+  if (Object.keys(scopedSecrets).length > 0) {
+    const stub = getSandboxStub(env, sandboxId);
+    await stub.setEnvVars(scopedSecrets);
   }
 }
 
@@ -139,7 +254,9 @@ async function execInSandbox(env, sandboxId, command) {
   return output || "(no output)";
 }
 
-// ─── File upload helper ───────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// File upload helper
+// ═══════════════════════════════════════════════════════════════════════════════
 
 async function parseMultipart(request, env, sandboxId) {
   const formData = await request.formData();
@@ -151,25 +268,27 @@ async function parseMultipart(request, env, sandboxId) {
     if (value && typeof value === "object" && "name" in value && "size" in value) {
       const fileContent = await value.arrayBuffer();
       const filePath = `/workspace/${value.name}`;
-      const base64Content = btoa(String.fromCharCode(...new Uint8Array(fileContent)));
-      await execInSandbox(env, sandboxId, `echo '${base64Content}' | base64 -d > '${filePath}'`);
+      const base64Content = uint8ToBase64(new Uint8Array(fileContent));
+      await execInSandbox(env, sandboxId, `echo -n '${base64Content}' | base64 -d > '${filePath}'`);
       files.push({ name: value.name, path: filePath });
     }
   }
   return { prompt, sessionId, files };
 }
 
-// ─── MCP server: expose sandbox as MCP tools (JSON-RPC 2.0, no external deps) ─
+// ═══════════════════════════════════════════════════════════════════════════════
+// MCP server — expose sandbox as MCP tools (JSON-RPC 2.0, no external deps)
+// ═══════════════════════════════════════════════════════════════════════════════
 
 const MCP_TOOLS = [
   {
     name: "exec",
-    description: "Execute a shell command inside an isolated Linux sandbox. The sandbox has BWS_ACCESS_TOKEN and BWS_TOKEN env vars set for Bitwarden Secrets Manager access. Git, curl, python3, node, npm, pip, etc. are available.",
+    description: "Execute a shell command inside an isolated Linux sandbox. The sandbox has scoped Bitwarden secrets available as env vars (not the raw BWS token). Git, curl, python3, node, npm, pip, etc. are available.",
     inputSchema: {
       type: "object",
       properties: {
         command: { type: "string", description: "The shell command to execute" },
-        sessionId: { type: "string", description: "Sandbox session ID for persistence (defaults to 'default')" },
+        sessionId: { type: "string", description: "SandboxV2 session ID for persistence (defaults to 'default')" },
       },
       required: ["command"],
     },
@@ -181,7 +300,7 @@ const MCP_TOOLS = [
       type: "object",
       properties: {
         path: { type: "string", description: "Absolute path to the file to read" },
-        sessionId: { type: "string", description: "Sandbox session ID (defaults to 'default')" },
+        sessionId: { type: "string", description: "SandboxV2 session ID (defaults to 'default')" },
       },
       required: ["path"],
     },
@@ -194,18 +313,18 @@ const MCP_TOOLS = [
       properties: {
         path: { type: "string", description: "Absolute path to write to" },
         content: { type: "string", description: "Text content to write" },
-        sessionId: { type: "string", description: "Sandbox session ID (defaults to 'default')" },
+        sessionId: { type: "string", description: "SandboxV2 session ID (defaults to 'default')" },
       },
       required: ["path", "content"],
     },
   },
 ];
 
-async function callMcpTool(name, args, env) {
+async function callMcpTool(name, args, env, botId) {
   const sessionId = args.sessionId || "default";
-  const sandboxId = `${env.SANDBOX_ID_PREFIX || "llm-session"}-${sessionId}`;
+  const sandboxId = getSandboxId(env, botId, sessionId);
   if (name === "exec") {
-    await setupSandboxEnv(env, sandboxId);
+    await setupSandboxEnv(env, sandboxId, botId);
     const output = await execInSandbox(env, sandboxId, args.command);
     return { content: [{ type: "text", text: output }] };
   }
@@ -214,14 +333,16 @@ async function callMcpTool(name, args, env) {
     return { content: [{ type: "text", text: output }] };
   }
   if (name === "write_file") {
-    const base64Content = btoa(args.content);
-    await execInSandbox(env, sandboxId, `echo '${base64Content}' | base64 -d > '${args.path}'`);
+    // Use a heredoc with a unique delimiter to safely write content
+    const delimiter = `GOOSE_WRITE_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const safeContent = args.content.replace(/\r\n/g, "\n");
+    await execInSandbox(env, sandboxId, `cat > '${args.path}' << '${delimiter}'\n${safeContent}\n${delimiter}`);
     return { content: [{ type: "text", text: `File written to ${args.path}` }] };
   }
   return { isError: true, content: [{ type: "text", text: `Unknown tool: ${name}` }] };
 }
 
-async function handleMcp(request, env) {
+async function handleMcp(request, env, botId) {
   const method = request.method;
   if (method === "GET") {
     const stream = new ReadableStream({
@@ -239,28 +360,28 @@ async function handleMcp(request, env) {
   }
   if (Array.isArray(message)) {
     const results = [];
-    for (const msg of message) { const res = await processJsonRpc(msg, env); if (res) results.push(res); }
+    for (const msg of message) { const res = await processJsonRpc(msg, env, botId); if (res) results.push(res); }
     return new Response(JSON.stringify(results), { headers: { "Content-Type": "application/json" } });
   }
-  const response = await processJsonRpc(message, env);
+  const response = await processJsonRpc(message, env, botId);
   if (!response) { return new Response(null, { status: 202 }); }
 
   const headers = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Mcp-Session-Id": crypto.randomUUID() };
   return new Response("event: message\ndata: " + JSON.stringify(response) + "\n\n", { headers });
 }
 
-async function processJsonRpc(message, env) {
+async function processJsonRpc(message, env, botId) {
   const { id, method, params } = message;
   if (id === undefined || id === null) { return null; }
   let result;
   switch (method) {
     case "initialize":
-      result = { protocolVersion: "2026-07-28", capabilities: { tools: { listChanged: false } }, serverInfo: { name: "sandbox-router", version: "1.0.0" } };
+      result = { protocolVersion: "2026-07-28", capabilities: { tools: { listChanged: false } }, serverInfo: { name: "sandbox-router", version: "2.0.0" } };
       break;
     case "notifications/initialized": return { jsonrpc: "2.0", id, result: {} };
     case "tools/list": result = { tools: MCP_TOOLS }; break;
     case "tools/call":
-      try { result = await callMcpTool(params.name, params.arguments || {}, env); }
+      try { result = await callMcpTool(params.name, params.arguments || {}, env, botId); }
       catch (err) { result = { isError: true, content: [{ type: "text", text: `Error: ${err.message}` }] }; }
       break;
     case "ping": result = {}; break;
@@ -269,20 +390,86 @@ async function processJsonRpc(message, env) {
   return { jsonrpc: "2.0", id, result };
 }
 
-// ─── Main Worker ──────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// /secrets endpoint — list and resolve scoped Bitwarden secrets for a bot
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// GET  /secrets          → list available secret keys (not values) for the bot
+// POST /secrets          → resolve specific secrets (body: {"keys": ["KEY1", ...]})
+//                          returns {"secrets": {"KEY1": "value1", ...}}
+
+async function handleSecrets(request, env, botId) {
+  const scopes = getBotScopes(env)[botId] || [];
+
+  if (request.method === "GET") {
+    return new Response(JSON.stringify({
+      botId,
+      availableSecrets: scopes,
+    }), { headers: { "Content-Type": "application/json" } });
+  }
+
+  if (request.method === "POST") {
+    let body;
+    try { body = await request.json(); } catch {
+      return new Response(JSON.stringify({ error: "Invalid JSON body" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    }
+    const requestedKeys = body.keys || [];
+    // Only allow keys within the bot's scope
+    const allowedKeys = requestedKeys.filter((k) => scopes.includes(k));
+    if (allowedKeys.length === 0) {
+      return new Response(JSON.stringify({ error: "No requested keys are within the bot's scope", botId, scopes }), { status: 403, headers: { "Content-Type": "application/json" } });
+    }
+
+    // Use a transient sandbox to resolve secrets
+    const sandboxId = getSandboxId(env, botId, "secret-resolution");
+    const scopedSecrets = await resolveScopedSecrets(env, sandboxId, botId);
+    const result = {};
+    for (const key of allowedKeys) {
+      if (scopedSecrets[key]) result[key] = scopedSecrets[key];
+    }
+    return new Response(JSON.stringify({ secrets: result }), { headers: { "Content-Type": "application/json" } });
+  }
+
+  return new Response("Method not allowed", { status: 405 });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Main Worker
+// ═══════════════════════════════════════════════════════════════════════════════
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    if (url.pathname === "/mcp") {
-      return handleMcp(request, env);
-    }
-
+    // Health check — no auth required
     if (url.pathname === "/health") {
-      return new Response(JSON.stringify({ status: "ok" }), { headers: { "Content-Type": "application/json" } });
+      return new Response(JSON.stringify({
+        status: "ok",
+        version: "2.0.0",
+        authEnabled: Object.keys(getBotKeys(env)).length > 0,
+      }), { headers: { "Content-Type": "application/json" } });
     }
 
+    // Authenticate all other endpoints
+    const botId = authenticateBot(request, env);
+    if (!botId) {
+      return new Response(JSON.stringify({ error: "Unauthorized — provide a valid bot API key via Authorization: Bearer <key>" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // MCP server
+    if (url.pathname === "/mcp") {
+      return handleMcp(request, env, botId);
+    }
+
+    // Secrets endpoint — list/resolve scoped Bitwarden secrets
+    if (url.pathname === "/secrets") {
+      return handleSecrets(request, env, botId);
+    }
+
+    // Main sandbox execution endpoint
     if (url.pathname === "/" && request.method === "POST") {
       const contentType = request.headers.get("Content-Type") || "";
       const maxIterations = parseInt(env.MAX_ITERATIONS || "10", 10);
@@ -290,8 +477,8 @@ export default {
 
       if (contentType.includes("multipart/form-data")) {
         sessionId = url.searchParams.get("sessionId") || "default";
-        const sandboxId = `${env.SANDBOX_ID_PREFIX || "llm-session"}-${sessionId}`;
-        await setupSandboxEnv(env, sandboxId);
+        const sandboxId = getSandboxId(env, botId, sessionId);
+        await setupSandboxEnv(env, sandboxId, botId);
         const parsed = await parseMultipart(request, env, sandboxId);
         userPrompt = parsed.prompt;
         sessionId = parsed.sessionId;
@@ -311,8 +498,8 @@ export default {
         return new Response(JSON.stringify({ error: "Missing 'prompt' field" }), { status: 400, headers: { "Content-Type": "application/json" } });
       }
 
-      const sandboxId = `${env.SANDBOX_ID_PREFIX || "llm-session"}-${sessionId}`;
-      await setupSandboxEnv(env, sandboxId);
+      const sandboxId = getSandboxId(env, botId, sessionId);
+      await setupSandboxEnv(env, sandboxId, botId);
 
       const messages = [
         { role: "system", content: SYSTEM_PROMPT },
@@ -336,20 +523,44 @@ export default {
         }
       }
 
-      return new Response(JSON.stringify({ sessionId, sandboxId, model: env.LLM_MODEL || "@cf/meta/llama-3.3-70b-instruct-fp8-fast", uploadedFiles, iterations: messages.filter((m) => m.role === "assistant").length, finalResponse: messages[messages.length - 1]?.content, executionLog }, null, 2), { headers: { "Content-Type": "application/json" } });
+      return new Response(JSON.stringify({
+        botId,
+        sessionId,
+        sandboxId,
+        model: env.LLM_MODEL || "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        uploadedFiles,
+        iterations: messages.filter((m) => m.role === "assistant").length,
+        finalResponse: messages[messages.length - 1]?.content,
+        executionLog,
+      }, null, 2), { headers: { "Content-Type": "application/json" } });
     }
 
+    // File download from sandbox
     if (url.pathname === "/file" && request.method === "GET") {
       const sessionId = url.searchParams.get("session") || "default";
       const filePath = url.searchParams.get("path");
       if (!filePath) { return new Response(JSON.stringify({ error: "Missing 'path' parameter" }), { status: 400, headers: { "Content-Type": "application/json" } }); }
-      const sandboxId = `${env.SANDBOX_ID_PREFIX || "llm-session"}-${sessionId}`;
+      const sandboxId = getSandboxId(env, botId, sessionId);
       const output = await execInSandbox(env, sandboxId, `cat '${filePath}'`);
       return new Response(output, { headers: { "Content-Type": "text/plain" } });
     }
 
     if (url.pathname === "/favicon.ico") { return new Response(null, { status: 404 }); }
 
-    return new Response(JSON.stringify({ name: "sandbox-router", endpoints: { "POST /": "Sandbox mode (shell execution + file upload)", "GET /file": "Download file from sandbox", "GET /health": "Health check", "POST /mcp": "MCP server (Streamable HTTP)" }, status: "ok" }), { headers: { "content-type": "application/json" } });
+    // Service info
+    return new Response(JSON.stringify({
+      name: "sandbox-router",
+      version: "2.0.0",
+      endpoints: {
+        "POST /": "SandboxV2 mode (shell execution + file upload)",
+        "GET /file": "Download file from sandbox",
+        "GET /health": "Health check",
+        "POST /mcp": "MCP server (Streamable HTTP)",
+        "GET /secrets": "List scoped secret keys for authenticated bot",
+        "POST /secrets": "Resolve scoped secrets for authenticated bot",
+      },
+      auth: Object.keys(getBotKeys(env)).length > 0 ? "enabled" : "disabled (backward-compatible)",
+      status: "ok",
+    }), { headers: { "Content-Type": "application/json" } });
   },
 };

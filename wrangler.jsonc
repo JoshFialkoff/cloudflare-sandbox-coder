@@ -23,13 +23,17 @@
   "durable_objects": {
     "bindings": [
       {
-        "class_name": "Sandbox",
+        "class_name": "SandboxV2",
         "name": "SANDBOX"
       }
     ]
   },
   "exports": {
     "Sandbox": {
+      "type": "durable-object",
+      "state": "deleted"
+    },
+    "SandboxV2": {
       "type": "durable-object",
       "storage": "sqlite",
       "container": "sandbox-router-sandbox"
@@ -43,7 +47,9 @@
     "GOOGLE_ADS_CUSTOMER_ID": "587-159-6696",
     "MAX_ITERATIONS": "25",
     "SANDBOX_ID_PREFIX": "llm-session",
-    "LLM_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    "LLM_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "BOT_KEYS": "{}",
+    "BOT_SECRET_SCOPES": "{}"
   },
   "secrets": {
     "required": [

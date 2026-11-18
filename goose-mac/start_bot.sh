@@ -1,11 +1,12 @@
 #!/bin/bash
-# Goose for macOS Launcher — OAuth2 + Keychain + Worker-side secrets
+# Goose for macOS Launcher — OAuth2 + Keychain + Worker-side scoped secrets
 #
 # The Bitwarden machine account token lives ONLY as the Cloudflare Worker
-# secret `bitwarden_token`. This script:
+# secret `bitwarden_secret`. This script:
 #   1. Loads CF Access credentials from macOS Keychain (OAuth2 service token)
-#   2. Fetches bot secrets from the Worker's /secrets endpoint (server-side BWS)
-#   3. Launches Goose with those secrets in its environment
+#   2. Authenticates to the Worker with a per-bot API key
+#   3. Fetches scoped bot secrets from the Worker's /secrets endpoint
+#   4. Launches Goose with those secrets in its environment
 #
 # No tokens are stored on disk or passed through chat.
 
@@ -38,10 +39,6 @@ if ! command -v goose &> /dev/null; then
     echo "   Install: brew install goose"
     exit 1
 fi
-if ! command -v security &> /dev/null; then
-    echo -e "${RED}❌ macOS Keychain (security) not available.${NC}"
-    exit 1
-fi
 
 # ─── Load CF Access creds from Keychain ───
 echo -e "${GREEN}🔑 Loading Cloudflare Access credentials from Keychain...${NC}"
@@ -54,35 +51,90 @@ else
     echo -e "${GREEN}✓ Access credentials loaded${NC}"
 fi
 
-# ─── Load bot secrets from Bitwarden Secrets Manager (bws) ───
-# Values are exported into the process environment only — never printed, logged, or written to disk.
-if [ -n "$SECRET_KEYS" ]; then
-    echo -e "${GREEN}🔐 Loading bot secrets from Bitwarden (bws) — values are never printed${NC}"
+# ─── Load bot API key from Keychain ───
+# The bot API key authenticates to the Worker and determines which Bitwarden
+# secrets the bot is allowed to access (scoped access).
+BOT_API_KEY=$(security find-generic-password -s "$KEYCHAIN_SERVICE" -a BOT_API_KEY -w 2>/dev/null || true)
+if [ -n "$BOT_API_KEY" ]; then
+    echo -e "${GREEN}✓ Bot API key loaded from Keychain${NC}"
+    AUTH_HEADER="Authorization: Bearer $BOT_API_KEY"
+else
+    echo -e "${YELLOW}⚠️  No bot API key in Keychain — using unauthenticated mode (BOT_KEYS must be empty on Worker)${NC}"
+    AUTH_HEADER=""
+fi
 
-    command -v bws >/dev/null 2>&1 || { echo -e "${RED}❌ bws CLI not found (brew install bitwarden-cli)${NC}"; exit 1; }
-    command -v jq >/dev/null 2>&1 || { echo -e "${RED}❌ jq not found (brew install jq)${NC}"; exit 1; }
-    if [ -z "${BWS_ACCESS_TOKEN:-}" ]; then
-        [ -f "$HOME/.secrets/bws_token" ] || { echo -e "${RED}❌ No BWS access token (set BWS_ACCESS_TOKEN or create ~/.secrets/bws_token, chmod 600)${NC}"; exit 1; }
-        export BWS_ACCESS_TOKEN="$(cat "$HOME/.secrets/bws_token")"
-    fi
+# ─── Load bot secrets via Worker /secrets endpoint (scoped) ───
+# The Worker uses its server-side bitwarden_secret to resolve only the keys
+# the bot is authorized for. No BWS token touches the Mac.
+if [ -n "$SECRET_KEYS" ] && [ -n "$BOT_API_KEY" ]; then
+    echo -e "${GREEN}🔐 Loading scoped bot secrets from Worker /secrets endpoint — values are never printed${NC}"
 
-    IFS=',' read -r -a KEYS <<< "$SECRET_KEYS"
-    for KEY in "${KEYS[@]}"; do
-        KEY="${KEY// /}"
-        [ -n "$KEY" ] || continue
-        ID=$(bws secret list "$BWS_PROJECT_ID" | jq -r --arg k "$KEY" '.[] | select(.key==$k) | .id' | head -1)
-        if [ -z "$ID" ]; then
-            echo -e "${YELLOW}   ⚠️  $KEY not found in Bitwarden project${NC}"
-            continue
-        fi
-        VALUE=$(bws secret get "$ID" | jq -r '.value')
-        if [ -n "$VALUE" ]; then
-            export "$KEY=$VALUE"
-            echo -e "${GREEN}   ✓ $KEY loaded (value hidden)${NC}"
+    # Build JSON body with requested keys
+    KEYS_JSON=$(echo "$SECRET_KEYS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' | jq -R . | jq -s . | jq -c '{keys: .}')
+
+    # Call the Worker to resolve secrets server-side
+    RESPONSE=$(curl -s -X POST "${ENDPOINT}/secrets" \
+        -H "Content-Type: application/json" \
+        ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
+        -d "$KEYS_JSON" 2>/dev/null) || RESPONSE=""
+
+    if [ -n "$RESPONSE" ] && echo "$RESPONSE" | jq -e '.secrets' >/dev/null 2>&1; then
+        # Export each resolved secret into the environment
+        for KEY in $(echo "$SECRET_KEYS" | tr ',' ' '); do
+            KEY="${KEY// /}"
+            [ -n "$KEY" ] || continue
+            VALUE=$(echo "$RESPONSE" | jq -r --arg k "$KEY" '.secrets[$k] // empty')
+            if [ -n "$VALUE" ] && [ "$VALUE" != "null" ]; then
+                export "$KEY=$VALUE"
+                echo -e "${GREEN}   ✓ $KEY loaded (value hidden)${NC}"
+            else
+                echo -e "${YELLOW}   ⚠️  $KEY not available in bot scope${NC}"
+            fi
+        done
+    else
+        echo -e "${YELLOW}⚠️  Worker /secrets endpoint did not return secrets — falling back to local bws${NC}"
+        # Fallback: use local bws CLI if available
+        if command -v bws &> /dev/null && [ -n "${BWS_ACCESS_TOKEN:-}" ]; then
+            IFS=',' read -r -a KEYS <<< "$SECRET_KEYS"
+            for KEY in "${KEYS[@]}"; do
+                KEY="${KEY// /}"
+                [ -n "$KEY" ] || continue
+                ID=$(bws secret list "$BWS_PROJECT_ID" | jq -r --arg k "$KEY" '.[] | select(.key==$k) | .id' | head -1)
+                if [ -n "$ID" ]; then
+                    VALUE=$(bws secret get "$ID" | jq -r '.value')
+                    if [ -n "$VALUE" ]; then
+                        export "$KEY=$VALUE"
+                        echo -e "${GREEN}   ✓ $KEY loaded via local bws (value hidden)${NC}"
+                    fi
+                fi
+            done
         else
-            echo -e "${YELLOW}   ⚠️  $KEY returned an empty value${NC}"
+            echo -e "${RED}❌ Cannot load secrets: Worker endpoint failed and no local bws fallback${NC}"
         fi
-    done
+    fi
+elif [ -n "$SECRET_KEYS" ]; then
+    echo -e "${YELLOW}⚠️  SECRET_KEYS set but no bot API key — falling back to local bws${NC}"
+    # Fallback: use local bws CLI
+    if command -v bws &> /dev/null; then
+        command -v jq >/dev/null 2>&1 || { echo -e "${RED}❌ jq not found${NC}"; exit 1; }
+        if [ -z "${BWS_ACCESS_TOKEN:-}" ]; then
+            [ -f "$HOME/.secrets/bws_token" ] || { echo -e "${RED}❌ No BWS access token${NC}"; exit 1; }
+            export BWS_ACCESS_TOKEN="$(cat "$HOME/.secrets/bws_token")"
+        fi
+        IFS=',' read -r -a KEYS <<< "$SECRET_KEYS"
+        for KEY in "${KEYS[@]}"; do
+            KEY="${KEY// /}"
+            [ -n "$KEY" ] || continue
+            ID=$(bws secret list "$BWS_PROJECT_ID" | jq -r --arg k "$KEY" '.[] | select(.key==$k) | .id' | head -1)
+            if [ -n "$ID" ]; then
+                VALUE=$(bws secret get "$ID" | jq -r '.value')
+                if [ -n "$VALUE" ]; then
+                    export "$KEY=$VALUE"
+                    echo -e "${GREEN}   ✓ $KEY loaded via local bws (value hidden)${NC}"
+                fi
+            fi
+        done
+    fi
 fi
 
 # ─── Launch Goose ───
