@@ -2,17 +2,21 @@
 
 Turn your Mac into a secure AI coding agent that delegates execution to a Cloudflare Sandbox via an encrypted tunnel — with **zero secrets stored on your Mac**.
 
-## The Zero-Secrets Model
+## The Zero-Secrets Model (v2 — Per-Bot Scoped Access)
 
 | Secret | Location | Why |
 |--------|----------|-----|
-| Bitwarden Machine Account Token | **Cloudflare Worker secret** (`bitwarden_token`) | Encrypted at rest, never leaves Cloudflare |
-| API keys (OpenAI, Anthropic, …) | **Bitwarden Secrets Manager** | Worker resolves them server-side on demand |
+| Bitwarden Machine Account Token | **Cloudflare Worker secret** (`bitwarden_secret`) | Encrypted at rest, never leaves Cloudflare, never passed to sandboxes |
+| Per-Bot API Key | **macOS Keychain** | Authenticates bot to Worker, determines scoped secret access |
+| API keys (OpenAI, Anthropic, …) | **Bitwarden Secrets Manager** | Worker resolves only scoped keys server-side |
 | Cloudflare Access Service Token | **macOS Keychain** | Encrypted at rest, one-time paste, never in files |
 | Tunnel identity | **`~/.cloudflared/cert.pem`** via `cloudflared tunnel login` | OAuth2 browser flow — no token to share |
 
-> ✅ You've already done the important part: your Bitwarden Machine Account Token is saved
-> as the Worker secret `bitwarden_token` in the sandbox-router production settings.
+### What changed in v2
+
+**Before (v1):** The raw `bitwarden_secret` (BWS machine account token) was passed into every sandbox as `BWS_ACCESS_TOKEN` / `BWS_TOKEN` env vars. Any code running in the sandbox could use this token to access **all** secrets in the Bitwarden project.
+
+**After (v2):** The Worker resolves only the secrets a bot is authorized for and injects those **values** into the sandbox. The `bitwarden_secret` is used inline in a single `bws` command to fetch secrets, then is never stored in the sandbox environment. Each bot gets its own isolated container, and only sees the secrets it's scoped to access.
 
 ## Prerequisites
 
@@ -20,9 +24,28 @@ Turn your Mac into a secure AI coding agent that delegates execution to a Cloudf
 brew install goose cloudflared jq
 ```
 
-(`bws` is NOT required on the Mac anymore — the Worker owns the token.)
+## Step 1: Configure Bot Keys and Scopes
 
-## Step 1: Deploy the Worker with `bitwarden_token`
+Set these as Worker vars (via `wrangler.jsonc` or dashboard):
+
+```jsonc
+// wrangler.jsonc vars
+{
+  "BOT_KEYS": "{\"ads-bot\":\"key_abc123\",\"seo-bot\":\"key_def456\"}",
+  "BOT_SECRET_SCOPES": "{\"ads-bot\":[\"GOOGLE_ADS_CLIENT_ID\",\"GOOGLE_ADS_CLIENT_SECRET\",\"GOOGLE_ADS_DEVELOPER_TOKEN\",\"GOOGLE_ADS_REFRESH_TOKEN\"],\"seo-bot\":[\"OPENAI_API_KEY\"]}"
+}
+```
+
+- **BOT_KEYS**: JSON map of `botId → apiKey`. If empty `{}`, auth is disabled (backward-compatible).
+- **BOT_SECRET_SCOPES**: JSON map of `botId → [allowed secret keys]`. Only these keys will be resolved from Bitwarden for that bot.
+
+For production, set these as Worker secrets instead of vars:
+```bash
+npx wrangler secret put BOT_KEYS
+npx wrangler secret put BOT_SECRET_SCOPES
+```
+
+## Step 2: Deploy the Worker
 
 ```bash
 cd cloudflare-sandbox-coder
@@ -30,14 +53,11 @@ npm install
 
 # Set the secrets (one-time; token value typed at prompt, never stored)
 npx wrangler secret put bitwarden_token      # ← your Machine Account Token
-npx wrangler secret put BWS_PROJECT_ID        # ← Bitwarden project UUID
-npx wrangler secret put ACCESS_TEAM_DOMAIN     # ← e.g. your-team.cloudflareaccess.com
-npx wrangler secret put ACCESS_AUD             # ← Access application AUD tag
 
 npx wrangler deploy
 ```
 
-## Step 2: Configure Cloudflare Access
+## Step 3: Configure Cloudflare Access
 
 1. **Create a Service Token** — Zero Trust → Access → Service Auth → Create
    - Name: `goose-bot-token`
@@ -46,7 +66,7 @@ npx wrangler deploy
    - Policy: **Allow** when `Service Token exists`
 3. See [`tunnel/access-policy.md`](./tunnel/access-policy.md) for details.
 
-## Step 3: One-time Mac Setup (OAuth2 + Keychain)
+## Step 4: One-time Mac Setup
 
 ```bash
 # a) OAuth2 tunnel login — browser opens, you sign in. Creates cert.pem.
@@ -56,11 +76,12 @@ cd goose-mac/tunnel
 # b) Save CF Access Service Token to Keychain (paste once, encrypted)
 cd goose-mac
 ./scripts/save-access-creds.sh
+
+# c) Save bot API key to Keychain (the key you configured in BOT_KEYS)
+security add-generic-password -s goose-bot -a BOT_API_KEY -w "key_abc123"
 ```
 
-**That's it — no tokens in chat, no .env files, no bws on your Mac.**
-
-## Step 4: Start the Tunnel
+## Step 5: Start the Tunnel
 
 ```bash
 cd goose-mac/tunnel
@@ -69,25 +90,19 @@ cd goose-mac/tunnel
 ./tunnel-starter.sh install        # launchd — auto-start on reboot
 ```
 
-## Step 5: Verify the Full Flow
+## Step 6: Verify the Full Flow
 
 ```bash
 cd goose-mac/tunnel
 ./quick-test.sh
 ```
 
-Tests:
-1. **Unauthenticated request blocked** (403) — Access works
-2. **Authenticated health check** (200) — tunnel + Worker reachable
-3. **`/secrets` listing** (200) — Worker can talk to Bitwarden
-4. **Sandbox execution** (200) — code runs in the container
-
-## Step 6: Launch Goose with Secrets
+## Step 7: Launch Goose with Scoped Secrets
 
 ```bash
 cd goose-mac
 
-# List which secrets Goose needs from Bitwarden (comma-separated)
+# List which secrets Goose needs (comma-separated, must be in bot's scope)
 export SECRET_KEYS="OPENAI_API_KEY,ANTHROPIC_API_KEY"
 
 ./start_bot.sh
@@ -95,36 +110,44 @@ export SECRET_KEYS="OPENAI_API_KEY,ANTHROPIC_API_KEY"
 
 The script:
 1. Loads CF Access credentials from **Keychain**
-2. Calls the Worker's `POST /secrets` endpoint — the Worker uses `bitwarden_token`
-   to fetch values from Bitwarden **server-side**
-3. Exports them into Goose's environment (memory only)
-4. Launches Goose
+2. Loads bot API key from **Keychain**
+3. Calls the Worker's `POST /secrets` endpoint — the Worker uses `bitwarden_secret`
+   to fetch only scoped values from Bitwarden **server-side**
+4. Exports them into Goose's environment (memory only)
+5. Launches Goose
+
+## API Reference (v2)
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `POST /` | POST | Bot API key | Sandbox execution (shell commands + LLM) |
+| `GET /file` | GET | Bot API key | Download file from sandbox |
+| `GET /health` | GET | None | Health check (shows auth status) |
+| `POST /mcp` | POST | Bot API key | MCP server (Streamable HTTP) |
+| `GET /secrets` | GET | Bot API key | List available secret keys for bot |
+| `POST /secrets` | POST | Bot API key | Resolve scoped secrets (body: `{"keys": [...]}`) |
 
 ## Troubleshooting
 
-### `cloudflared tunnel list` → "Error decoding origin cert"
-Your `~/.cloudflared/cert.pem` has expired. Fix:
-```bash
-./tunnel-starter.sh login    # OAuth2 browser flow refreshes it
-```
+### 401 Unauthorized
+- Bot API key not set or incorrect
+- Check `BOT_KEYS` var/secret on the Worker
+- Ensure keychain has the right key: `security find-generic-password -s goose-bot -a BOT_API_KEY -w`
 
-### 403 on all requests
-- Run `./scripts/save-access-creds.sh` again (creds may be stale)
-- Check the Access policy requires the Service Token
-- Rotate the token in Zero Trust → Access → Service Auth if needed
-
-### `/secrets` returns 500
-- Confirm `bitwarden_token` secret is deployed: `npx wrangler secret list`
-- Confirm `BWS_PROJECT_ID` is set and the token has read access to that project
-- Test manually: `curl` the `/secrets` GET endpoint (should list keys)
+### Secrets not loading
+- Check `BOT_SECRET_SCOPES` includes the requested keys for the bot
+- Check `bitwarden_secret` is deployed: `npx wrangler secret list`
+- Verify BWS project ID matches: `BWS_PROJECT_ID` var
 
 ### Sandbox task fails
-- Check `npx wrangler deployments list` — latest deploy includes `/secrets` + `secrets:` support
+- Check `npx wrangler deployments list`
 - Verify the container image built: `npx wrangler deploy --dry-run`
 
 ## Security Checklist
 
-- [ ] `bitwarden_token` exists only as a Worker secret (never in git/env/chat)
+- [ ] `bitwarden_secret` exists only as a Worker secret (never in git/env/chat/sandbox)
+- [ ] Per-bot API keys stored in **Keychain**, not files
+- [ ] `BOT_SECRET_SCOPES` limits each bot to only the secrets it needs
 - [ ] `BWS_ACCESS_TOKEN` has **read-only** access in Bitwarden
 - [ ] CF Access policy allows **Service Tokens only**
 - [ ] CF Access creds in **Keychain**, not files
