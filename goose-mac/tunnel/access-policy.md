@@ -12,7 +12,7 @@ your authenticated bots can reach the `sandbox-router`.
 5. Configure:
    - **Application Name**: `Goose Bot API`
    - **Session Duration**: `24 hours` (or shorter for bots)
-   - **Domain**: `bot-api.yourdomain.com`
+   - **Domain**: `bot-api.assistedly.ai`
    - **Domain Type**: `Path` (leave empty for root)
 
 ## Step 2: Create an Access Policy
@@ -51,7 +51,7 @@ Your bot passes these tokens in request headers. The tunnel/Cloudflare edge vali
 ```bash
 curl -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
      -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
-     https://bot-api.yourdomain.com/health
+     https://bot-api.assistedly.ai/health
 ```
 
 ### Goose Configuration
@@ -60,7 +60,7 @@ Configure Goose (or your HTTP client) to include these headers on every request 
 
 ```json
 {
-  "sandbox_api_url": "https://bot-api.yourdomain.com",
+  "sandbox_api_url": "https://bot-api.assistedly.ai",
   "headers": {
     "CF-Access-Client-Id": "{{env.CF_ACCESS_CLIENT_ID}}",
     "CF-Access-Client-Secret": "{{env.CF_ACCESS_CLIENT_SECRET}}"
@@ -83,7 +83,7 @@ Configure Goose (or your HTTP client) to include these headers on every request 
 
 ## Policy Enforcement Checklist
 
-- [ ] Application is configured for `bot-api.yourdomain.com`
+- [ ] Application is configured for `bot-api.assistedly.ai`
 - [ ] Policy requires Service Token (not just identity/login)
 - [ ] `goose-bot-token` is the only active Service Token for this app
 - [ ] No bypass policies exist for the bot API

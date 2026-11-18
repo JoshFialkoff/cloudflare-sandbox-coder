@@ -11,11 +11,13 @@
   },
   "containers": [
     {
-      "class_name": "Sandbox",
       "name": "sandbox-router-sandbox",
-      "image": "registry.cloudflare.com/ad9d77d8f16147c01ff26b56d41cb5a9/sandbox-router:0965c6bebb23",
-      "instance_type": "lite",
-      "max_instances": 3
+      "scheduling_policy": "durable_object",
+      "images": {
+        "sandbox": {
+          "dockerfile": "Dockerfile"
+        }
+      }
     }
   ],
   "durable_objects": {
@@ -29,7 +31,8 @@
   "exports": {
     "Sandbox": {
       "type": "durable-object",
-      "storage": "sqlite"
+      "storage": "sqlite",
+      "container": "sandbox-router-sandbox"
     }
   },
   "ai": {

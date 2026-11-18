@@ -1,7 +1,48 @@
-import { getSandbox } from "@cloudflare/sandbox";
+import { DurableObject } from "cloudflare:workers";
 
-// Export the Sandbox Durable Object class — required by Wrangler
-export { Sandbox } from "@cloudflare/sandbox";
+// ─── Sandbox Durable Object ──────────────────────────────────────────────────
+// Replaces the old @cloudflare/sandbox 0.x Sandbox DO class.
+// Manages a Cloudflare Container instance and exposes exec/setEnvVars via RPC.
+
+export class Sandbox extends DurableObject {
+  async ensureRunning() {
+    const container = this.ctx.container;
+    if (!container) throw new Error("Container binding is not configured");
+    if (!container.running) {
+      container.start({ image: container.images.sandbox, enableInternet: true });
+    }
+  }
+
+  async setEnvVars(vars) {
+    const stored = (await this.ctx.storage.get("envVars")) || {};
+    Object.assign(stored, vars);
+    await this.ctx.storage.put("envVars", stored);
+  }
+
+  async exec(command) {
+    await this.ensureRunning();
+    const envVars = (await this.ctx.storage.get("envVars")) || {};
+    let fullCommand = command;
+    if (Object.keys(envVars).length > 0) {
+      const exports = Object.entries(envVars)
+        .map(([k, v]) => `export ${k}=${shellQuote(v)}`)
+        .join("; ");
+      fullCommand = `${exports}; ${command}`;
+    }
+    const process = await this.ctx.container.exec(["sh", "-c", fullCommand]);
+    const { exitCode, stdout, stderr } = await process.output();
+    const decoder = new TextDecoder();
+    return {
+      exitCode,
+      stdout: stdout ? decoder.decode(stdout) : "",
+      stderr: stderr ? decoder.decode(stderr) : "",
+    };
+  }
+}
+
+function shellQuote(v) {
+  return `'${String(v).replace(/'/g, "'\\''")}'`;
+}
 
 // ─── System Prompt: Enforce shell-based code execution ───────────────────────
 
@@ -69,23 +110,28 @@ async function callLLM(messages, env) {
   return content;
 }
 
-// ─── Sandbox execution ───────────────────────────────────────────────────────
+// ─── Sandbox access via Durable Object RPC ────────────────────────────────────
+
+function getSandboxStub(env, sandboxId) {
+  const id = env.SANDBOX.idFromName(sandboxId);
+  return env.SANDBOX.get(id);
+}
 
 async function setupSandboxEnv(env, sandboxId) {
-  const sandbox = getSandbox(env.SANDBOX, sandboxId);
+  const stub = getSandboxStub(env, sandboxId);
   const envVars = {};
   if (env.bitwarden_secret) {
     envVars.BWS_ACCESS_TOKEN = env.bitwarden_secret;
     envVars.BWS_TOKEN = env.bitwarden_secret;
   }
   if (Object.keys(envVars).length > 0) {
-    await sandbox.setEnvVars(envVars);
+    await stub.setEnvVars(envVars);
   }
 }
 
 async function execInSandbox(env, sandboxId, command) {
-  const sandbox = getSandbox(env.SANDBOX, sandboxId);
-  const result = await sandbox.exec(command);
+  const stub = getSandboxStub(env, sandboxId);
+  const result = await stub.exec(command);
   let output = "";
   if (result.stdout) output += result.stdout;
   if (result.stderr) output += (output ? "\n" : "") + `[stderr] ${result.stderr}`;

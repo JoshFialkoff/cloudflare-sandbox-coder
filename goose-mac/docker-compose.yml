@@ -30,7 +30,7 @@ services:
       - BWS_ACCESS_TOKEN=${BWS_ACCESS_TOKEN}
       - BWS_PROJECT_ID=${BWS_PROJECT_ID}
       - GOOSE_PROFILE=${GOOSE_PROFILE:-default}
-      - SANDBOX_API_URL=${SANDBOX_API_URL:-https://bot-api.yourdomain.com}
+      - SANDBOX_API_URL=${SANDBOX_API_URL:-https://sandbox-router.forwardjump-com198.workers.dev}
     command: >
       sh -c "
         # Install bws if not present in the image
