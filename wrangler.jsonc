@@ -31,7 +31,6 @@
   "exports": {
     "Sandbox": {
       "type": "durable-object",
-      "state": "deleted"
     },
     "SandboxV2": {
       "type": "durable-object",
